@@ -2,8 +2,10 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 
 const bg = Color(0xFF100D0D);
@@ -17,8 +19,19 @@ const blood = Color(0xFFA94443);
 const bloodBright = Color(0xFFD15A55);
 const silver = Color(0xFFCBC9C8);
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.example.nexus_player.channel.audio',
+    androidNotificationChannelName: 'Nexus Player',
+    androidNotificationOngoing: true,
+    androidStopForegroundOnPause: true,
+  );
+
+  final session = await AudioSession.instance;
+  await session.configure(const AudioSessionConfiguration.music());
+
   runApp(const NexusPlayerApp());
 }
 
@@ -160,7 +173,18 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await _audioPlayer.setAudioSource(AudioSource.uri(Uri.parse(track.uri)));
+      await _audioPlayer.setAudioSource(
+        AudioSource.uri(
+          Uri.parse(track.uri),
+          tag: MediaItem(
+            id: track.id.toString(),
+            title: track.title,
+            artist: track.artist,
+            duration: track.duration,
+            album: track.album,
+          ),
+        ),
+      );
       await _audioPlayer.play();
     } catch (_) {
       errorMessage = 'Этот файл не удалось открыть.';
@@ -282,9 +306,22 @@ class _PlayerRootState extends State<PlayerRoot> {
     return AnimatedBuilder(
       animation: controller,
       builder: (context, _) {
-        return controller.playerOpen && controller.currentTrack != null
-            ? PlayerScreen(controller: controller)
-            : LibraryScreen(controller: controller);
+        final showPlayer =
+            controller.playerOpen && controller.currentTrack != null;
+
+        return PopScope(
+          canPop: !showPlayer,
+          onPopInvokedWithResult: (didPop, _) {
+            if (didPop) return;
+            // System back while player is open → return to track list
+            if (showPlayer) {
+              controller.backToLibrary();
+            }
+          },
+          child: showPlayer
+              ? PlayerScreen(controller: controller)
+              : LibraryScreen(controller: controller),
+        );
       },
     );
   }
@@ -300,7 +337,7 @@ class LibraryScreen extends StatefulWidget {
 }
 
 class _LibraryScreenState extends State<LibraryScreen> {
-  int tab = 0;
+  int tab = 1; // 0 = playlists/queue, 1 = full track list (default)
   String query = '';
 
   @override
@@ -967,7 +1004,12 @@ class PlayerScreen extends StatelessWidget {
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    const Expanded(flex: 7, child: Center(child: VinylStage())),
+                    Expanded(
+                      flex: 7,
+                      child: Center(
+                        child: VinylStage(isPlaying: controller.isPlaying),
+                      ),
+                    ),
                     const SizedBox(height: 22),
                     Text(
                       track.title,
@@ -1136,28 +1178,69 @@ class _PlayButton extends StatelessWidget {
 }
 
 class VinylStage extends StatefulWidget {
-  const VinylStage({super.key});
+  const VinylStage({required this.isPlaying, super.key});
+
+  final bool isPlaying;
 
   @override
   State<VinylStage> createState() => _VinylStageState();
 }
 
 class _VinylStageState extends State<VinylStage>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController controller;
+    with TickerProviderStateMixin {
+  late final AnimationController _spinController;
+  late final AnimationController _beatController;
+  bool _wasPlaying = false;
 
   @override
   void initState() {
     super.initState();
-    controller = AnimationController(
+    _spinController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 9),
-    )..repeat();
+      duration: const Duration(seconds: 8),
+    );
+    _beatController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+    );
+
+    if (widget.isPlaying) {
+      _spinController.repeat();
+      _startBeat();
+    }
+    _wasPlaying = widget.isPlaying;
+  }
+
+  void _startBeat() {
+    _beatController.repeat(reverse: true);
+  }
+
+  void _stopBeat() {
+    _beatController.stop();
+    _beatController.animateTo(0, duration: const Duration(milliseconds: 300));
+  }
+
+  @override
+  void didUpdateWidget(covariant VinylStage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isPlaying == _wasPlaying) return;
+    _wasPlaying = widget.isPlaying;
+
+    if (widget.isPlaying) {
+      // Smooth start spinning
+      _spinController.repeat();
+      _startBeat();
+    } else {
+      // Smooth stop
+      _spinController.stop();
+      _stopBeat();
+    }
   }
 
   @override
   void dispose() {
-    controller.dispose();
+    _spinController.dispose();
+    _beatController.dispose();
     super.dispose();
   }
 
@@ -1169,17 +1252,27 @@ class _VinylStageState extends State<VinylStage>
         return Container(
           width: size,
           height: size,
-          padding: EdgeInsets.all(size * .12),
+          padding: EdgeInsets.all(size * .08),
           decoration: BoxDecoration(
             color: const Color(0xFF0B090A),
             border: Border.all(color: const Color(0x1ACBC9C8)),
           ),
           child: AnimatedBuilder(
-            animation: controller,
-            builder: (_, child) => Transform.rotate(
-              angle: controller.value * pi * 2,
-              child: child,
-            ),
+            animation: Listenable.merge([_spinController, _beatController]),
+            builder: (_, child) {
+              // Slight beat "jerk" — scale + tiny wobble
+              final beat = _beatController.value;
+              final scale = 1.0 + (beat * 0.018);
+              final wobble = (beat - 0.5) * 0.012;
+
+              return Transform.scale(
+                scale: scale,
+                child: Transform.rotate(
+                  angle: _spinController.value * pi * 2 + wobble,
+                  child: child,
+                ),
+              );
+            },
             child: const VinylDisc(),
           ),
         );
@@ -1197,6 +1290,7 @@ class VinylDisc extends StatelessWidget {
   }
 }
 
+/// Black vinyl with white label — matches the reference photo
 class VinylPainter extends CustomPainter {
   const VinylPainter();
 
@@ -1204,33 +1298,63 @@ class VinylPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = min(size.width, size.height) / 2;
+
+    // Main black disc with subtle radial gradient
     final discPaint = Paint()
-      ..shader = const RadialGradient(
-        colors: [Color(0xFFE1DEDC), Color(0xFFBBB8B7), Color(0xFF817D7F)],
+      ..shader = RadialGradient(
+        colors: const [
+          Color(0xFF2A2A2A),
+          Color(0xFF111111),
+          Color(0xFF050505),
+        ],
+        stops: const [0.0, 0.55, 1.0],
       ).createShader(Rect.fromCircle(center: center, radius: radius));
     canvas.drawCircle(center, radius, discPaint);
 
-    final rings = Paint()
+    // Fine grooves
+    final groovePaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
-    for (var index = 0; index < 5; index++) {
-      final ring = [0.91, .82, .7, .57, .4][index];
-      rings.color = index.isEven
-          ? const Color(0x556E696B)
-          : const Color(0x66F4F1EE);
-      canvas.drawCircle(center, radius * ring, rings);
+      ..strokeWidth = 0.7;
+    for (var i = 0; i < 28; i++) {
+      final t = 0.22 + (i / 28) * 0.72;
+      final alpha = (i.isEven ? 0.14 : 0.07);
+      groovePaint.color = Color.fromRGBO(255, 255, 255, alpha);
+      canvas.drawCircle(center, radius * t, groovePaint);
     }
 
+    // Outer rim highlight
     canvas.drawCircle(
       center,
-      radius * .18,
-      Paint()..color = const Color(0xFF292526),
+      radius * 0.985,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2
+        ..color = const Color(0x33FFFFFF),
     );
-    canvas.drawCircle(center, radius * .1, Paint()..color = blood);
+
+    // White center label
+    final labelRadius = radius * 0.22;
     canvas.drawCircle(
       center,
-      radius * .025,
-      Paint()..color = const Color(0xFF1B1718),
+      labelRadius,
+      Paint()..color = const Color(0xFFF5F5F5),
+    );
+
+    // Soft inner shadow on label
+    canvas.drawCircle(
+      center,
+      labelRadius * 0.92,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3
+        ..color = const Color(0x22000000),
+    );
+
+    // Center spindle hole
+    canvas.drawCircle(
+      center,
+      radius * 0.035,
+      Paint()..color = const Color(0xFF1A1A1A),
     );
   }
 

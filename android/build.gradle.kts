@@ -13,28 +13,19 @@ subprojects {
     project.layout.buildDirectory.value(newSubprojectBuildDir)
 }
 
-// Fix namespace + JVM target for old plugins (on_audio_query)
+// Fix namespace for old plugins (on_audio_query etc.) that break on AGP 8+
 subprojects {
     afterEvaluate {
         if (plugins.hasPlugin("com.android.library") || plugins.hasPlugin("com.android.application")) {
             extensions.findByType(com.android.build.gradle.BaseExtension::class.java)?.let { androidExt ->
                 if (androidExt.namespace.isNullOrEmpty()) {
+                    // Prefer known namespace for on_audio_query, otherwise use project name
                     androidExt.namespace = if (name.contains("on_audio_query")) {
                         "com.lucasjosino.on_audio_query"
                     } else {
                         name
                     }
                 }
-                androidExt.compileOptions {
-                    sourceCompatibility = JavaVersion.VERSION_11
-                    targetCompatibility = JavaVersion.VERSION_11
-                }
-            }
-        }
-
-        tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
-            kotlinOptions {
-                jvmTarget = "11"
             }
         }
     }
