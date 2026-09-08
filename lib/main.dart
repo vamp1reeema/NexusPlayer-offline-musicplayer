@@ -2,11 +2,14 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'dart:convert';
+
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:on_audio_query/on_audio_query.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 const bg = Color(0xFF100D0D);
 const panel = Color(0xFF1C1517);
@@ -67,6 +70,8 @@ class DeviceTrack {
     required this.duration,
     required this.uri,
     this.album,
+    this.size = 0,
+    this.dateAdded = 0,
   });
 
   final int id;
@@ -75,9 +80,42 @@ class DeviceTrack {
   final Duration duration;
   final String uri;
   final String? album;
+  final int size; // bytes
+  final int dateAdded;
 }
 
 enum RepeatMode { off, one }
+
+enum TrackSort { title, durationAsc, durationDesc, sizeAsc, sizeDesc, dateAdded }
+
+class UserPlaylist {
+  UserPlaylist({
+    required this.id,
+    required this.name,
+    List<int>? trackIds,
+    int? createdAt,
+  })  : trackIds = trackIds ?? [],
+        createdAt = createdAt ?? DateTime.now().millisecondsSinceEpoch;
+
+  final String id;
+  String name;
+  final List<int> trackIds;
+  final int createdAt;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'trackIds': trackIds,
+        'createdAt': createdAt,
+      };
+
+  factory UserPlaylist.fromJson(Map<String, dynamic> json) => UserPlaylist(
+        id: json['id'] as String,
+        name: json['name'] as String,
+        trackIds: List<int>.from(json['trackIds'] as List? ?? const []),
+        createdAt: json['createdAt'] as int? ?? 0,
+      );
+}
 
 class PlayerController extends ChangeNotifier {
   PlayerController() {
@@ -92,6 +130,7 @@ class PlayerController extends ChangeNotifier {
       }
       notifyListeners();
     });
+    _loadPlaylists();
   }
 
   final OnAudioQuery _audioQuery = OnAudioQuery();
@@ -99,6 +138,7 @@ class PlayerController extends ChangeNotifier {
   final Random _random = Random();
 
   List<DeviceTrack> tracks = const [];
+  List<DeviceTrack> queue = const [];
   DeviceTrack? currentTrack;
   Duration progress = Duration.zero;
   bool isPlaying = false;
@@ -108,10 +148,129 @@ class PlayerController extends ChangeNotifier {
   bool playerOpen = false;
   bool shuffle = false;
   RepeatMode repeatMode = RepeatMode.off;
+  TrackSort sort = TrackSort.title;
   String? errorMessage;
+
+  // Playlists
+  List<UserPlaylist> playlists = [];
+  Set<int> favoriteIds = {};
+  List<int> historyIds = [];
+  UserPlaylist? openPlaylist; // null = library, non-null = viewing a playlist
 
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<PlayerState>? _playerStateSubscription;
+
+  List<DeviceTrack> tracksForIds(List<int> ids) {
+    final byId = {for (final t in tracks) t.id: t};
+    return ids.map((id) => byId[id]).whereType<DeviceTrack>().toList();
+  }
+
+  List<DeviceTrack> get favoriteTracks => tracksForIds(favoriteIds.toList());
+
+  List<DeviceTrack> get historyTracks => tracksForIds(historyIds);
+
+  Future<void> _loadPlaylists() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('playlists_v1');
+      if (raw != null) {
+        final data = jsonDecode(raw) as Map<String, dynamic>;
+        playlists = (data['playlists'] as List? ?? [])
+            .map((e) => UserPlaylist.fromJson(e as Map<String, dynamic>))
+            .toList();
+        favoriteIds = Set<int>.from(data['favorites'] as List? ?? []);
+        historyIds = List<int>.from(data['history'] as List? ?? []);
+      }
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  Future<void> _savePlaylists() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        'playlists_v1',
+        jsonEncode({
+          'playlists': playlists.map((p) => p.toJson()).toList(),
+          'favorites': favoriteIds.toList(),
+          'history': historyIds,
+        }),
+      );
+    } catch (_) {}
+  }
+
+  Future<void> createPlaylist(String name) async {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return;
+    playlists = [
+      ...playlists,
+      UserPlaylist(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        name: trimmed,
+      ),
+    ];
+    await _savePlaylists();
+    notifyListeners();
+  }
+
+  Future<void> deletePlaylist(String id) async {
+    playlists = playlists.where((p) => p.id != id).toList();
+    if (openPlaylist?.id == id) openPlaylist = null;
+    await _savePlaylists();
+    notifyListeners();
+  }
+
+  Future<void> addTrackToPlaylist(String playlistId, int trackId) async {
+    final idx = playlists.indexWhere((p) => p.id == playlistId);
+    if (idx < 0) return;
+    final p = playlists[idx];
+    if (p.trackIds.contains(trackId)) return;
+    p.trackIds.add(trackId);
+    playlists = List.from(playlists);
+    await _savePlaylists();
+    notifyListeners();
+  }
+
+  Future<void> removeTrackFromPlaylist(String playlistId, int trackId) async {
+    final idx = playlists.indexWhere((p) => p.id == playlistId);
+    if (idx < 0) return;
+    playlists[idx].trackIds.remove(trackId);
+    playlists = List.from(playlists);
+    await _savePlaylists();
+    notifyListeners();
+  }
+
+  Future<void> toggleFavorite(int trackId) async {
+    if (favoriteIds.contains(trackId)) {
+      favoriteIds.remove(trackId);
+    } else {
+      favoriteIds.add(trackId);
+    }
+    favoriteIds = Set.from(favoriteIds);
+    await _savePlaylists();
+    notifyListeners();
+  }
+
+  bool isFavorite(int trackId) => favoriteIds.contains(trackId);
+
+  void _pushHistory(int trackId) {
+    historyIds.remove(trackId);
+    historyIds.insert(0, trackId);
+    if (historyIds.length > 100) {
+      historyIds = historyIds.sublist(0, 100);
+    }
+    _savePlaylists();
+  }
+
+  void openPlaylistView(UserPlaylist? playlist) {
+    openPlaylist = playlist;
+    notifyListeners();
+  }
+
+  void closePlaylistView() {
+    openPlaylist = null;
+    notifyListeners();
+  }
 
   Future<void> scanDevice() async {
     isScanning = true;
@@ -151,9 +310,12 @@ class PlayerController extends ChangeNotifier {
                   duration: Duration(milliseconds: song.duration ?? 0),
                   uri: song.uri ?? song.data,
                   album: song.album,
+                  size: song.size ?? 0,
+                  dateAdded: song.dateAdded ?? 0,
                 ),
               )
               .toList();
+          _applySort();
         }
       }
     } catch (_) {
@@ -165,11 +327,20 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  Future<void> selectTrack(DeviceTrack track) async {
+  Future<void> selectTrack(
+    DeviceTrack track, {
+    List<DeviceTrack>? fromQueue,
+  }) async {
+    if (fromQueue != null && fromQueue.isNotEmpty) {
+      queue = List.from(fromQueue);
+    } else if (queue.isEmpty) {
+      queue = List.from(tracks);
+    }
     currentTrack = track;
     progress = Duration.zero;
     playerOpen = true;
     errorMessage = null;
+    _pushHistory(track.id);
     notifyListeners();
 
     try {
@@ -193,6 +364,11 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
+  Future<void> playAll(List<DeviceTrack> list) async {
+    if (list.isEmpty) return;
+    await selectTrack(list.first, fromQueue: list);
+  }
+
   Future<void> togglePlayback() async {
     if (currentTrack == null) return;
     if (isPlaying) {
@@ -209,14 +385,16 @@ class PlayerController extends ChangeNotifier {
       await seek(Duration.zero);
       return;
     }
-    if (tracks.isEmpty || currentTrack == null) return;
-    final index = tracks.indexOf(currentTrack!);
-    final previousIndex = index <= 0 ? tracks.length - 1 : index - 1;
-    await selectTrack(tracks[previousIndex]);
+    final list = queue.isNotEmpty ? queue : tracks;
+    if (list.isEmpty || currentTrack == null) return;
+    final index = list.indexWhere((t) => t.id == currentTrack!.id);
+    final previousIndex = index <= 0 ? list.length - 1 : index - 1;
+    await selectTrack(list[previousIndex], fromQueue: list);
   }
 
   Future<void> next() async {
-    if (tracks.isEmpty || currentTrack == null) return;
+    final list = queue.isNotEmpty ? queue : tracks;
+    if (list.isEmpty || currentTrack == null) return;
     await _playNext();
   }
 
@@ -235,6 +413,33 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setSort(TrackSort value) {
+    sort = value;
+    _applySort();
+    notifyListeners();
+  }
+
+  void _applySort() {
+    final list = List<DeviceTrack>.from(tracks);
+    list.sort((a, b) {
+      switch (sort) {
+        case TrackSort.title:
+          return a.title.toLowerCase().compareTo(b.title.toLowerCase());
+        case TrackSort.durationAsc:
+          return a.duration.compareTo(b.duration);
+        case TrackSort.durationDesc:
+          return b.duration.compareTo(a.duration);
+        case TrackSort.sizeAsc:
+          return a.size.compareTo(b.size);
+        case TrackSort.sizeDesc:
+          return b.size.compareTo(a.size);
+        case TrackSort.dateAdded:
+          return b.dateAdded.compareTo(a.dateAdded);
+      }
+    });
+    tracks = list;
+  }
+
   Future<void> _advanceAfterCompletion() async {
     if (repeatMode == RepeatMode.one) {
       await _audioPlayer.seek(Duration.zero);
@@ -245,17 +450,18 @@ class PlayerController extends ChangeNotifier {
   }
 
   Future<void> _playNext() async {
-    if (tracks.isEmpty || currentTrack == null) return;
-    final currentIndex = tracks.indexOf(currentTrack!);
+    final list = queue.isNotEmpty ? queue : tracks;
+    if (list.isEmpty || currentTrack == null) return;
+    final currentIndex = list.indexWhere((t) => t.id == currentTrack!.id);
     var nextIndex = currentIndex + 1;
-    if (shuffle && tracks.length > 1) {
+    if (shuffle && list.length > 1) {
       do {
-        nextIndex = _random.nextInt(tracks.length);
+        nextIndex = _random.nextInt(list.length);
       } while (nextIndex == currentIndex);
-    } else if (nextIndex >= tracks.length) {
+    } else if (nextIndex >= list.length) {
       nextIndex = 0;
     }
-    await selectTrack(tracks[nextIndex]);
+    await selectTrack(list[nextIndex], fromQueue: list);
   }
 
   static String _cleanTitle(String value) {
@@ -308,14 +514,16 @@ class _PlayerRootState extends State<PlayerRoot> {
       builder: (context, _) {
         final showPlayer =
             controller.playerOpen && controller.currentTrack != null;
+        final showPlaylist = controller.openPlaylist != null;
 
         return PopScope(
-          canPop: !showPlayer,
+          canPop: !showPlayer && !showPlaylist,
           onPopInvokedWithResult: (didPop, _) {
             if (didPop) return;
-            // System back while player is open → return to track list
             if (showPlayer) {
               controller.backToLibrary();
+            } else if (showPlaylist) {
+              controller.closePlaylistView();
             }
           },
           child: showPlayer
@@ -337,12 +545,211 @@ class LibraryScreen extends StatefulWidget {
 }
 
 class _LibraryScreenState extends State<LibraryScreen> {
-  int tab = 1; // 0 = playlists/queue, 1 = full track list (default)
+  int tab = 1; // 0 = playlists, 1 = tracks
   String query = '';
+
+  void _showSortMenu() {
+    final controller = widget.controller;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (context) {
+        Widget item(String label, TrackSort value) {
+          final selected = controller.sort == value;
+          return ListTile(
+            title: Text(
+              label,
+              style: TextStyle(
+                color: selected ? bloodBright : text,
+                fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+              ),
+            ),
+            trailing: selected
+                ? const Icon(Icons.check, color: bloodBright, size: 18)
+                : null,
+            onTap: () {
+              controller.setSort(value);
+              Navigator.pop(context);
+            },
+          );
+        }
+
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Padding(
+                padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Сортировка',
+                    style: TextStyle(
+                      color: text,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              item('По названию', TrackSort.title),
+              item('По длительности ↑ (короче)', TrackSort.durationAsc),
+              item('По длительности ↓ (длиннее)', TrackSort.durationDesc),
+              item('По размеру ↑ (меньше)', TrackSort.sizeAsc),
+              item('По размеру ↓ (больше)', TrackSort.sizeDesc),
+              item('По дате добавления', TrackSort.dateAdded),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showCreatePlaylistDialog() async {
+    final nameController = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: panel,
+        title: const Text('Создать плейлист', style: TextStyle(color: text)),
+        content: TextField(
+          controller: nameController,
+          autofocus: true,
+          style: const TextStyle(color: text),
+          decoration: const InputDecoration(
+            hintText: 'Название плейлиста',
+            hintStyle: TextStyle(color: muted),
+            enabledBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: line),
+            ),
+            focusedBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: bloodBright),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отменить', style: TextStyle(color: muted)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, nameController.text),
+            child: const Text('OK', style: TextStyle(color: bloodBright)),
+          ),
+        ],
+      ),
+    );
+    if (result != null && result.trim().isNotEmpty) {
+      await widget.controller.createPlaylist(result);
+    }
+  }
+
+  Future<void> _showAddToPlaylist(DeviceTrack track) async {
+    final controller = widget.controller;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    track.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: text,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(20, 0, 20, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Добавить в плейлист',
+                    style: TextStyle(color: muted, fontSize: 12),
+                  ),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.favorite_border, color: bloodBright),
+                title: Text(
+                  controller.isFavorite(track.id)
+                      ? 'Убрать из избранного'
+                      : 'В избранное',
+                  style: const TextStyle(color: text),
+                ),
+                onTap: () {
+                  controller.toggleFavorite(track.id);
+                  Navigator.pop(context);
+                },
+              ),
+              if (controller.playlists.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(20),
+                  child: Text(
+                    'Нет плейлистов. Создай новый во вкладке «Плейлисты».',
+                    style: TextStyle(color: muted, fontSize: 13),
+                  ),
+                )
+              else
+                ...controller.playlists.map((p) {
+                  final added = p.trackIds.contains(track.id);
+                  return ListTile(
+                    leading: Icon(
+                      added ? Icons.check_circle : Icons.playlist_add,
+                      color: added ? bloodBright : textDim,
+                    ),
+                    title: Text(p.name, style: const TextStyle(color: text)),
+                    subtitle: Text(
+                      '${p.trackIds.length} треков',
+                      style: const TextStyle(color: muted, fontSize: 11),
+                    ),
+                    onTap: () async {
+                      if (added) {
+                        await controller.removeTrackFromPlaylist(p.id, track.id);
+                      } else {
+                        await controller.addTrackToPlaylist(p.id, track.id);
+                      }
+                      if (context.mounted) Navigator.pop(context);
+                    },
+                  );
+                }),
+              const SizedBox(height: 12),
+            ],
+          ),
+        );
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final controller = widget.controller;
+
+    if (controller.openPlaylist != null) {
+      return _PlaylistDetailScreen(
+        controller: controller,
+        playlist: controller.openPlaylist!,
+        onAddToPlaylist: _showAddToPlaylist,
+      );
+    }
+
     final visibleTracks = controller.tracks.where((track) {
       final value = '${track.title} ${track.artist}'.toLowerCase();
       return value.contains(query.toLowerCase());
@@ -354,113 +761,141 @@ class _LibraryScreenState extends State<LibraryScreen> {
           children: [
             _LibraryHeader(onScan: controller.scanDevice),
             Expanded(
-              child: RefreshIndicator(
-                color: bloodBright,
-                backgroundColor: panel,
-                onRefresh: controller.scanDevice,
-                child: CustomScrollView(
-                  physics: const AlwaysScrollableScrollPhysics(),
-                  slivers: [
-                    SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(20, 34, 20, 0),
-                      sliver: SliverToBoxAdapter(
-                        child: _LibraryIntro(
-                          isPlaylist: tab == 0,
-                          query: query,
-                          onQueryChanged: (value) =>
-                              setState(() => query = value),
-                        ),
-                      ),
-                    ),
-                    SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(20, 42, 20, 0),
-                      sliver: SliverToBoxAdapter(
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            Text(
-                              tab == 0 ? 'Очередь на сегодня' : 'Список треков',
-                              style: const TextStyle(
-                                color: text,
-                                fontSize: 17,
-                                fontWeight: FontWeight.w600,
+              child: tab == 0
+                  ? _PlaylistsTab(
+                      controller: controller,
+                      onCreate: _showCreatePlaylistDialog,
+                    )
+                  : RefreshIndicator(
+                      color: bloodBright,
+                      backgroundColor: panel,
+                      onRefresh: controller.scanDevice,
+                      child: CustomScrollView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        slivers: [
+                          SliverPadding(
+                            padding: const EdgeInsets.fromLTRB(20, 34, 20, 0),
+                            sliver: SliverToBoxAdapter(
+                              child: _LibraryIntro(
+                                isPlaylist: false,
+                                query: query,
+                                onQueryChanged: (value) =>
+                                    setState(() => query = value),
                               ),
                             ),
-                            Text(
-                              '${visibleTracks.length} / ${controller.tracks.length}',
-                              style: const TextStyle(
-                                color: muted,
-                                fontSize: 11,
+                          ),
+                          SliverPadding(
+                            padding: const EdgeInsets.fromLTRB(20, 42, 20, 0),
+                            sliver: SliverToBoxAdapter(
+                              child: Row(
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  const Text(
+                                    'Список треков',
+                                    style: TextStyle(
+                                      color: text,
+                                      fontSize: 17,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  Row(
+                                    children: [
+                                      Text(
+                                        '${visibleTracks.length}',
+                                        style: const TextStyle(
+                                          color: muted,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      GestureDetector(
+                                        onTap: _showSortMenu,
+                                        child: const Icon(
+                                          Icons.sort_rounded,
+                                          color: textDim,
+                                          size: 22,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
                               ),
                             ),
-                          ],
-                        ),
+                          ),
+                          if (controller.isLoading)
+                            const SliverFillRemaining(
+                              hasScrollBody: false,
+                              child: Center(
+                                child: CircularProgressIndicator(
+                                  color: bloodBright,
+                                ),
+                              ),
+                            )
+                          else if (controller.permissionDenied)
+                            SliverFillRemaining(
+                              hasScrollBody: false,
+                              child: _EmptyLibrary(
+                                title: 'Нужен доступ к музыке',
+                                message:
+                                    'Разрешите доступ к аудиофайлам, чтобы показать все треки, скачанные на телефон.',
+                                action: 'Повторить сканирование',
+                                onPressed: controller.scanDevice,
+                              ),
+                            )
+                          else if (controller.tracks.isEmpty)
+                            SliverFillRemaining(
+                              hasScrollBody: false,
+                              child: _EmptyLibrary(
+                                title: 'Треки не найдены',
+                                message:
+                                    'Список строится из медиатеки устройства. Файлы короче 10 секунд автоматически скрываются.',
+                                action: 'Сканировать устройство',
+                                onPressed: controller.scanDevice,
+                              ),
+                            )
+                          else if (visibleTracks.isEmpty)
+                            SliverFillRemaining(
+                              hasScrollBody: false,
+                              child: _EmptyLibrary(
+                                title: 'Ничего не найдено',
+                                message:
+                                    'Попробуйте изменить поисковый запрос.',
+                                action: 'Очистить поиск',
+                                onPressed: () async =>
+                                    setState(() => query = ''),
+                              ),
+                            )
+                          else
+                            SliverPadding(
+                              padding:
+                                  const EdgeInsets.fromLTRB(20, 14, 20, 126),
+                              sliver: SliverList.separated(
+                                itemCount: visibleTracks.length,
+                                separatorBuilder: (_, __) =>
+                                    const Divider(color: line, height: 1),
+                                itemBuilder: (context, index) {
+                                  final track = visibleTracks[index];
+                                  final current =
+                                      controller.currentTrack?.id == track.id;
+                                  return TrackTile(
+                                    index: index + 1,
+                                    track: track,
+                                    current: current,
+                                    playing: current && controller.isPlaying,
+                                    onTap: () => controller.selectTrack(
+                                      track,
+                                      fromQueue: visibleTracks,
+                                    ),
+                                    onMore: () => _showAddToPlaylist(track),
+                                  );
+                                },
+                              ),
+                            ),
+                        ],
                       ),
                     ),
-                    if (controller.isLoading)
-                      const SliverFillRemaining(
-                        hasScrollBody: false,
-                        child: Center(
-                          child: CircularProgressIndicator(color: bloodBright),
-                        ),
-                      )
-                    else if (controller.permissionDenied)
-                      SliverFillRemaining(
-                        hasScrollBody: false,
-                        child: _EmptyLibrary(
-                          title: 'Нужен доступ к музыке',
-                          message:
-                              'Разрешите доступ к аудиофайлам, чтобы показать все треки, скачанные на телефон.',
-                          action: 'Повторить сканирование',
-                          onPressed: controller.scanDevice,
-                        ),
-                      )
-                    else if (controller.tracks.isEmpty)
-                      SliverFillRemaining(
-                        hasScrollBody: false,
-                        child: _EmptyLibrary(
-                          title: 'Треки не найдены',
-                          message:
-                              'Список строится из медиатеки устройства. Файлы короче 10 секунд автоматически скрываются.',
-                          action: 'Сканировать устройство',
-                          onPressed: controller.scanDevice,
-                        ),
-                      )
-                    else if (visibleTracks.isEmpty)
-                      SliverFillRemaining(
-                        hasScrollBody: false,
-                        child: _EmptyLibrary(
-                          title: 'Ничего не найдено',
-                          message: 'Попробуйте изменить поисковый запрос.',
-                          action: 'Очистить поиск',
-                          onPressed: () async => setState(() => query = ''),
-                        ),
-                      )
-                    else
-                      SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(20, 14, 20, 126),
-                        sliver: SliverList.separated(
-                          itemCount: visibleTracks.length,
-                          separatorBuilder: (_, __) =>
-                              const Divider(color: line, height: 1),
-                          itemBuilder: (context, index) {
-                            final track = visibleTracks[index];
-                            final current =
-                                controller.currentTrack?.id == track.id;
-                            return TrackTile(
-                              index: index + 1,
-                              track: track,
-                              current: current,
-                              playing: current && controller.isPlaying,
-                              onTap: () => controller.selectTrack(track),
-                            );
-                          },
-                        ),
-                      ),
-                  ],
-                ),
-              ),
             ),
           ],
         ),
@@ -636,6 +1071,7 @@ class TrackTile extends StatelessWidget {
     required this.current,
     required this.playing,
     required this.onTap,
+    this.onMore,
     super.key,
   });
 
@@ -644,11 +1080,13 @@ class TrackTile extends StatelessWidget {
   final bool current;
   final bool playing;
   final VoidCallback onTap;
+  final VoidCallback? onMore;
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
       onTap: onTap,
+      onLongPress: onMore,
       splashColor: blood.withValues(alpha: .16),
       highlightColor: blood.withValues(alpha: .08),
       child: Padding(
@@ -698,12 +1136,26 @@ class TrackTile extends StatelessWidget {
               formatDuration(track.duration),
               style: const TextStyle(color: muted, fontSize: 10),
             ),
-            const SizedBox(width: 6),
-            Icon(
-              Icons.chevron_right_rounded,
-              color: current ? bloodBright : muted,
-              size: 18,
-            ),
+            if (onMore != null) ...[
+              const SizedBox(width: 4),
+              IconButton(
+                onPressed: onMore,
+                icon: Icon(
+                  Icons.more_vert_rounded,
+                  color: current ? bloodBright : muted,
+                  size: 18,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              ),
+            ] else ...[
+              const SizedBox(width: 6),
+              Icon(
+                Icons.chevron_right_rounded,
+                color: current ? bloodBright : muted,
+                size: 18,
+              ),
+            ],
           ],
         ),
       ),
@@ -806,6 +1258,7 @@ class _BottomBar extends StatelessWidget {
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
                           children: [
                             Text(
                               currentTrack!.title,
@@ -816,10 +1269,7 @@ class _BottomBar extends StatelessWidget {
                             const SizedBox(height: 3),
                             Text(
                               isPlaying ? 'Воспроизводится сейчас' : 'На паузе',
-                              style: const TextStyle(
-                                color: muted,
-                                fontSize: 10,
-                              ),
+                              style: const TextStyle(color: muted, fontSize: 10),
                             ),
                           ],
                         ),
@@ -840,11 +1290,11 @@ class _BottomBar extends StatelessWidget {
                 ),
               ),
             SizedBox(
-              height: 59,
+              height: 56,
               child: Row(
                 children: [
-                  _navItem(Icons.album_rounded, 'Плейлист', 0),
-                  _navItem(Icons.queue_music_rounded, 'Список треков', 1),
+                  _navItem(Icons.queue_music_rounded, 'Треки', 1),
+                  _navItem(Icons.playlist_play_rounded, 'Плейлисты', 0),
                 ],
               ),
             ),
@@ -862,7 +1312,7 @@ class _BottomBar extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(icon, size: 18, color: selected ? bloodBright : muted),
+            Icon(icon, size: 20, color: selected ? bloodBright : muted),
             const SizedBox(height: 4),
             Text(
               label,
@@ -873,6 +1323,333 @@ class _BottomBar extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+
+class _PlaylistsTab extends StatelessWidget {
+  const _PlaylistsTab({required this.controller, required this.onCreate});
+
+  final PlayerController controller;
+  final Future<void> Function() onCreate;
+
+  @override
+  Widget build(BuildContext context) {
+    final favorites = controller.favoriteTracks;
+    final history = controller.historyTracks;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 24, 20, 120),
+      children: [
+        const Text(
+          'Плейлисты',
+          style: TextStyle(
+            color: text,
+            fontSize: 22,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 18),
+        Row(
+          children: [
+            Expanded(
+              child: _PlaylistCard(
+                icon: Icons.favorite_rounded,
+                title: 'Избранное',
+                subtitle: '${favorites.length} треков',
+                onTap: () {
+                  controller.openPlaylistView(
+                    UserPlaylist(
+                      id: '__favorites__',
+                      name: 'Избранное',
+                      trackIds: controller.favoriteIds.toList(),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _PlaylistCard(
+                icon: Icons.history_rounded,
+                title: 'История',
+                subtitle: '${history.length} треков',
+                onTap: () {
+                  controller.openPlaylistView(
+                    UserPlaylist(
+                      id: '__history__',
+                      name: 'История',
+                      trackIds: List.from(controller.historyIds),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 20),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'Мои плейлисты',
+              style: TextStyle(
+                color: text,
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            IconButton(
+              onPressed: onCreate,
+              icon: const Icon(Icons.add_rounded, color: bloodBright),
+              tooltip: 'Создать плейлист',
+            ),
+          ],
+        ),
+        if (controller.playlists.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 40),
+            child: Center(
+              child: Text(
+                'Нажми + чтобы создать плейлист',
+                style: TextStyle(color: muted, fontSize: 13),
+              ),
+            ),
+          )
+        else
+          ...controller.playlists.map((p) {
+            final count = controller.tracksForIds(p.trackIds).length;
+            return ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: panelSoft,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: line),
+                ),
+                child: const Icon(Icons.music_note, color: muted),
+              ),
+              title: Text(p.name, style: const TextStyle(color: text)),
+              subtitle: Text(
+                '$count треков',
+                style: const TextStyle(color: muted, fontSize: 11),
+              ),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline, color: muted, size: 20),
+                onPressed: () => controller.deletePlaylist(p.id),
+              ),
+              onTap: () => controller.openPlaylistView(p),
+            );
+          }),
+      ],
+    );
+  }
+}
+
+class _PlaylistCard extends StatelessWidget {
+  const _PlaylistCard({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: panelSoft,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: line),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: bloodBright, size: 22),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              style: const TextStyle(
+                color: text,
+                fontWeight: FontWeight.w600,
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(subtitle, style: const TextStyle(color: muted, fontSize: 11)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PlaylistDetailScreen extends StatelessWidget {
+  const _PlaylistDetailScreen({
+    required this.controller,
+    required this.playlist,
+    required this.onAddToPlaylist,
+  });
+
+  final PlayerController controller;
+  final UserPlaylist playlist;
+  final Future<void> Function(DeviceTrack) onAddToPlaylist;
+
+  @override
+  Widget build(BuildContext context) {
+    final List<int> ids;
+    if (playlist.id == '__favorites__') {
+      ids = controller.favoriteIds.toList();
+    } else if (playlist.id == '__history__') {
+      ids = List.from(controller.historyIds);
+    } else {
+      final live = controller.playlists
+          .where((p) => p.id == playlist.id)
+          .firstOrNull;
+      ids = live?.trackIds ?? playlist.trackIds;
+    }
+    final tracks = controller.tracksForIds(ids);
+    final totalDuration = tracks.fold<Duration>(
+      Duration.zero,
+      (sum, t) => sum + t.duration,
+    );
+
+    return Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 8, 16, 0),
+              child: Row(
+                children: [
+                  IconButton(
+                    onPressed: controller.closePlaylistView,
+                    icon: const Icon(Icons.arrow_back_rounded, color: text),
+                  ),
+                  Expanded(
+                    child: Text(
+                      playlist.name,
+                      style: const TextStyle(
+                        color: text,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${tracks.length} треков · ${formatDuration(totalDuration)}',
+                    style: const TextStyle(color: muted, fontSize: 12),
+                  ),
+                  const SizedBox(height: 14),
+                  if (tracks.isNotEmpty)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: () => controller.playAll(tracks),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: silver,
+                              foregroundColor: bg,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(24),
+                              ),
+                            ),
+                            icon: const Icon(Icons.play_arrow_rounded),
+                            label: const Text('Воспроизвести все'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        IconButton(
+                          onPressed: () {
+                            controller.toggleShuffle();
+                            controller.playAll(tracks);
+                          },
+                          style: IconButton.styleFrom(
+                            backgroundColor: panelSoft,
+                          ),
+                          icon: Icon(
+                            Icons.shuffle_rounded,
+                            color: controller.shuffle ? bloodBright : textDim,
+                          ),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: tracks.isEmpty
+                  ? const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(28),
+                        child: Text(
+                          'Плейлист пуст\n\nДолгое нажатие на трек в списке → «Добавить в плейлист»',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: muted, fontSize: 13),
+                        ),
+                      ),
+                    )
+                  : ListView.separated(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 100),
+                      itemCount: tracks.length,
+                      separatorBuilder: (_, __) =>
+                          const Divider(color: line, height: 1),
+                      itemBuilder: (context, index) {
+                        final track = tracks[index];
+                        final current =
+                            controller.currentTrack?.id == track.id;
+                        return TrackTile(
+                          index: index + 1,
+                          track: track,
+                          current: current,
+                          playing: current && controller.isPlaying,
+                          onTap: () => controller.selectTrack(
+                            track,
+                            fromQueue: tracks,
+                          ),
+                          onMore: () => onAddToPlaylist(track),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+      bottomNavigationBar: _BottomBar(
+        selectedIndex: 0,
+        onChanged: (_) => controller.closePlaylistView(),
+        currentTrack: controller.currentTrack,
+        isPlaying: controller.isPlaying,
+        onMiniPlayerTap: controller.currentTrack == null
+            ? null
+            : () {
+                controller.playerOpen = true;
+                controller.notifyListeners();
+              },
+        onTogglePlayback: controller.currentTrack == null
+            ? null
+            : controller.togglePlayback,
       ),
     );
   }
@@ -1111,6 +1888,16 @@ class PlayerScreen extends StatelessWidget {
                         color: muted,
                         fontSize: 9,
                         letterSpacing: 1,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: IconButton(
+                        onPressed: controller.backToLibrary,
+                        icon: const Icon(Icons.close_rounded, size: 22),
+                        color: muted,
+                        tooltip: 'Закрыть',
                       ),
                     ),
                   ],
