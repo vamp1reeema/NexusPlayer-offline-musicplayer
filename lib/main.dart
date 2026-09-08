@@ -11,6 +11,8 @@ import 'package:just_audio_background/just_audio_background.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'equalizer.dart';
+
 const bg = Color(0xFF100D0D);
 const panel = Color(0xFF1C1517);
 const panelSoft = Color(0xFF241A1C);
@@ -30,6 +32,8 @@ Future<void> main() async {
     androidNotificationChannelName: 'Nexus Player',
     androidNotificationOngoing: true,
     androidStopForegroundOnPause: true,
+    fastForwardInterval: const Duration(seconds: 10),
+    rewindInterval: const Duration(seconds: 10),
   );
 
   final session = await AudioSession.instance;
@@ -130,6 +134,18 @@ class PlayerController extends ChangeNotifier {
       }
       notifyListeners();
     });
+    // Sync UI when user taps prev/next in the system notification
+    _currentIndexSubscription = _audioPlayer.currentIndexStream.listen((index) {
+      if (index == null) return;
+      final list = queue.isNotEmpty ? queue : tracks;
+      if (index < 0 || index >= list.length) return;
+      final track = list[index];
+      if (currentTrack?.id == track.id) return;
+      currentTrack = track;
+      progress = Duration.zero;
+      _pushHistory(track.id);
+      notifyListeners();
+    });
     _loadPlaylists();
   }
 
@@ -148,7 +164,7 @@ class PlayerController extends ChangeNotifier {
   bool playerOpen = false;
   bool shuffle = false;
   RepeatMode repeatMode = RepeatMode.off;
-  TrackSort sort = TrackSort.title;
+  TrackSort sort = TrackSort.dateAdded;
   String? errorMessage;
 
   // Playlists
@@ -159,6 +175,7 @@ class PlayerController extends ChangeNotifier {
 
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<PlayerState>? _playerStateSubscription;
+  StreamSubscription<int?>? _currentIndexSubscription;
 
   List<DeviceTrack> tracksForIds(List<int> ids) {
     final byId = {for (final t in tracks) t.id: t};
@@ -387,19 +404,39 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await _audioPlayer.setAudioSource(
-        AudioSource.uri(
-          Uri.parse(track.uri),
-          tag: MediaItem(
-            id: track.id.toString(),
-            title: track.title,
-            artist: track.artist,
-            duration: track.duration,
-            album: track.album,
-          ),
-        ),
+      final list = queue.isNotEmpty ? queue : tracks;
+      var initialIndex = list.indexWhere((t) => t.id == track.id);
+      if (initialIndex < 0) initialIndex = 0;
+
+      // Full queue → system notification gets prev / next buttons
+      await _audioPlayer.setAudioSources(
+        list
+            .map(
+              (t) => AudioSource.uri(
+                Uri.parse(t.uri),
+                tag: MediaItem(
+                  id: t.id.toString(),
+                  title: t.title,
+                  artist: t.artist,
+                  duration: t.duration,
+                  album: t.album,
+                ),
+              ),
+            )
+            .toList(),
+        initialIndex: initialIndex,
+        initialPosition: Duration.zero,
+      );
+      await _audioPlayer.setShuffleModeEnabled(shuffle);
+      await _audioPlayer.setLoopMode(
+        repeatMode == RepeatMode.one ? LoopMode.one : LoopMode.off,
       );
       await _audioPlayer.play();
+      // Attach system equalizer to this audio session (global for all tracks)
+      final sessionId = _audioPlayer.androidAudioSessionId;
+      if (sessionId != null) {
+        await EqualizerEngine.attach(sessionId);
+      }
     } catch (_) {
       errorMessage = 'Этот файл не удалось открыть.';
       isPlaying = false;
@@ -424,8 +461,12 @@ class PlayerController extends ChangeNotifier {
   Future<void> seek(Duration position) => _audioPlayer.seek(position);
 
   Future<void> previous() async {
-    if (progress > const Duration(seconds: 4)) {
+    if (progress > const Duration(seconds: 3)) {
       await seek(Duration.zero);
+      return;
+    }
+    if (_audioPlayer.hasPrevious) {
+      await _audioPlayer.seekToPrevious();
       return;
     }
     final list = queue.isNotEmpty ? queue : tracks;
@@ -436,6 +477,10 @@ class PlayerController extends ChangeNotifier {
   }
 
   Future<void> next() async {
+    if (_audioPlayer.hasNext) {
+      await _audioPlayer.seekToNext();
+      return;
+    }
     final list = queue.isNotEmpty ? queue : tracks;
     if (list.isEmpty || currentTrack == null) return;
     await _playNext();
@@ -446,13 +491,18 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void toggleShuffle() {
+  Future<void> toggleShuffle() async {
     shuffle = !shuffle;
+    await _audioPlayer.setShuffleModeEnabled(shuffle);
     notifyListeners();
   }
 
-  void toggleRepeat() {
-    repeatMode = repeatMode == RepeatMode.off ? RepeatMode.one : RepeatMode.off;
+  Future<void> toggleRepeat() async {
+    repeatMode =
+        repeatMode == RepeatMode.off ? RepeatMode.one : RepeatMode.off;
+    await _audioPlayer.setLoopMode(
+      repeatMode == RepeatMode.one ? LoopMode.one : LoopMode.off,
+    );
     notifyListeners();
   }
 
@@ -523,6 +573,7 @@ class PlayerController extends ChangeNotifier {
   void dispose() {
     _positionSubscription?.cancel();
     _playerStateSubscription?.cancel();
+    _currentIndexSubscription?.cancel();
     _audioPlayer.dispose();
     super.dispose();
   }
@@ -569,29 +620,28 @@ class _PlayerRootState extends State<PlayerRoot> {
               controller.closePlaylistView();
             }
           },
-          child: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 320),
-            switchInCurve: Curves.easeOutCubic,
-            switchOutCurve: Curves.easeInCubic,
-            transitionBuilder: (child, animation) {
-              final offset = Tween<Offset>(
-                begin: const Offset(0, 0.04),
-                end: Offset.zero,
-              ).animate(animation);
-              return FadeTransition(
-                opacity: animation,
-                child: SlideTransition(position: offset, child: child),
-              );
-            },
-            child: showPlayer
-                ? KeyedSubtree(
-                    key: const ValueKey('player'),
-                    child: PlayerScreen(controller: controller),
-                  )
-                : KeyedSubtree(
-                    key: const ValueKey('library'),
-                    child: LibraryScreen(controller: controller),
-                  ),
+          // Keep LibraryScreen mounted so scroll position is preserved
+          child: Stack(
+            children: [
+              TickerMode(
+                enabled: !showPlayer,
+                child: Offstage(
+                  offstage: showPlayer,
+                  child: LibraryScreen(controller: controller),
+                ),
+              ),
+              IgnorePointer(
+                ignoring: !showPlayer,
+                child: AnimatedOpacity(
+                  opacity: showPlayer ? 1 : 0,
+                  duration: const Duration(milliseconds: 280),
+                  curve: Curves.easeOutCubic,
+                  child: showPlayer
+                      ? PlayerScreen(controller: controller)
+                      : const SizedBox.expand(),
+                ),
+              ),
+            ],
           ),
         );
       },
@@ -779,6 +829,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onTap: () {
                   Navigator.pop(ctx);
                   _showTrackInfo(track);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.graphic_eq_rounded, color: textDim),
+                title: const Text(
+                  'Эквалайзер',
+                  style: TextStyle(color: text),
+                ),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const EqualizerScreen(),
+                    ),
+                  );
                 },
               ),
               ListTile(
@@ -2387,7 +2452,7 @@ class _VinylStageState extends State<VinylStage>
     // Full rotation every ~6.5s — visible continuous spin
     _spinController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 6500),
+      duration: const Duration(milliseconds: 4000),
     );
     // Sharp kick pulse (scale up then settle)
     _kickController = AnimationController(
@@ -2491,7 +2556,7 @@ class VinylDisc extends StatelessWidget {
   }
 }
 
-/// Black vinyl with white label — matches the reference photo
+/// Vinyl with asymmetric highlights so rotation is clearly visible
 class VinylPainter extends CustomPainter {
   const VinylPainter();
 
@@ -2500,62 +2565,132 @@ class VinylPainter extends CustomPainter {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = min(size.width, size.height) / 2;
 
-    // Main black disc with subtle radial gradient
+    // Base disc
     final discPaint = Paint()
       ..shader = RadialGradient(
         colors: const [
-          Color(0xFF2A2A2A),
-          Color(0xFF111111),
-          Color(0xFF050505),
+          Color(0xFF2E2E2E),
+          Color(0xFF141414),
+          Color(0xFF070707),
         ],
-        stops: const [0.0, 0.55, 1.0],
+        stops: const [0.0, 0.5, 1.0],
       ).createShader(Rect.fromCircle(center: center, radius: radius));
     canvas.drawCircle(center, radius, discPaint);
 
-    // Fine grooves
-    final groovePaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 0.7;
-    for (var i = 0; i < 28; i++) {
-      final t = 0.22 + (i / 28) * 0.72;
-      final alpha = (i.isEven ? 0.14 : 0.07);
-      groovePaint.color = Color.fromRGBO(255, 255, 255, alpha);
+    // Grooves — alternating brightness rings
+    final groovePaint = Paint()..style = PaintingStyle.stroke;
+    for (var i = 0; i < 36; i++) {
+      final t = 0.24 + (i / 36) * 0.70;
+      groovePaint.strokeWidth = i % 3 == 0 ? 1.1 : 0.55;
+      groovePaint.color = Color.fromRGBO(
+        255,
+        255,
+        255,
+        i % 3 == 0 ? 0.16 : (i.isEven ? 0.09 : 0.04),
+      );
       canvas.drawCircle(center, radius * t, groovePaint);
     }
 
-    // Outer rim highlight
+    // Asymmetric specular wedge (rotates with disc → visible spin)
+    final highlight = Path()
+      ..moveTo(center.dx, center.dy)
+      ..arcTo(
+        Rect.fromCircle(center: center, radius: radius * 0.96),
+        -0.55,
+        0.9,
+        false,
+      )
+      ..close();
+    canvas.drawPath(
+      highlight,
+      Paint()
+        ..shader = RadialGradient(
+          center: const Alignment(-0.35, -0.45),
+          radius: 0.85,
+          colors: const [
+            Color(0x55FFFFFF),
+            Color(0x18FFFFFF),
+            Color(0x00FFFFFF),
+          ],
+          stops: const [0.0, 0.35, 1.0],
+        ).createShader(Rect.fromCircle(center: center, radius: radius)),
+    );
+
+    // Second softer highlight opposite side
+    final highlight2 = Path()
+      ..moveTo(center.dx, center.dy)
+      ..arcTo(
+        Rect.fromCircle(center: center, radius: radius * 0.96),
+        2.2,
+        0.7,
+        false,
+      )
+      ..close();
+    canvas.drawPath(
+      highlight2,
+      Paint()..color = const Color(0x14FFFFFF),
+    );
+
+    // Colored reflective streak (makes spin obvious)
+    final streakPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = radius * 0.045
+      ..strokeCap = StrokeCap.round
+      ..color = const Color(0x44D15A55);
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius * 0.62),
+      -0.3,
+      0.55,
+      false,
+      streakPaint,
+    );
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius * 0.48),
+      1.1,
+      0.4,
+      false,
+      streakPaint..color = const Color(0x33CBC9C8),
+    );
+
+    // Outer rim
     canvas.drawCircle(
       center,
       radius * 0.985,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.2
-        ..color = const Color(0x33FFFFFF),
+        ..strokeWidth = 1.4
+        ..color = const Color(0x44FFFFFF),
     );
 
-    // White center label
-    final labelRadius = radius * 0.22;
+    // Label — slightly off-center pattern so rotation reads
+    final labelRadius = radius * 0.23;
     canvas.drawCircle(
       center,
       labelRadius,
-      Paint()..color = const Color(0xFFF5F5F5),
+      Paint()..color = const Color(0xFFF2F0EC),
     );
-
-    // Soft inner shadow on label
     canvas.drawCircle(
       center,
-      labelRadius * 0.92,
+      labelRadius * 0.88,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 3
-        ..color = const Color(0x22000000),
+        ..strokeWidth = 2.5
+        ..color = const Color(0x33000000),
+    );
+    // Small logo mark on label (asymmetric)
+    final mark = Offset(center.dx + labelRadius * 0.15, center.dy - labelRadius * 0.1);
+    canvas.drawCircle(mark, labelRadius * 0.18, Paint()..color = const Color(0xFFA94443));
+    canvas.drawCircle(
+      Offset(center.dx - labelRadius * 0.25, center.dy + labelRadius * 0.2),
+      labelRadius * 0.08,
+      Paint()..color = const Color(0xFF2A2A2A),
     );
 
-    // Center spindle hole
+    // Spindle hole
     canvas.drawCircle(
       center,
-      radius * 0.035,
-      Paint()..color = const Color(0xFF1A1A1A),
+      radius * 0.038,
+      Paint()..color = const Color(0xFF121212),
     );
   }
 
