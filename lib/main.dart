@@ -409,21 +409,24 @@ class PlayerController extends ChangeNotifier {
       if (initialIndex < 0) initialIndex = 0;
 
       // Full queue → system notification gets prev / next buttons
-      await _audioPlayer.setAudioSources(
-        list
-            .map(
-              (t) => AudioSource.uri(
-                Uri.parse(t.uri),
-                tag: MediaItem(
-                  id: t.id.toString(),
-                  title: t.title,
-                  artist: t.artist,
-                  duration: t.duration,
-                  album: t.album,
+      // just_audio 0.9.x: use ConcatenatingAudioSource (no setAudioSources yet)
+      await _audioPlayer.setAudioSource(
+        ConcatenatingAudioSource(
+          children: list
+              .map(
+                (t) => AudioSource.uri(
+                  Uri.parse(t.uri),
+                  tag: MediaItem(
+                    id: t.id.toString(),
+                    title: t.title,
+                    artist: t.artist,
+                    duration: t.duration,
+                    album: t.album,
+                  ),
                 ),
-              ),
-            )
-            .toList(),
+              )
+              .toList(),
+        ),
         initialIndex: initialIndex,
         initialPosition: Duration.zero,
       );
