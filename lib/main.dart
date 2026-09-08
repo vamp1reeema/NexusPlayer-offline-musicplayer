@@ -240,6 +240,49 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Tries to delete the audio file from device storage and removes it from lists.
+  Future<bool> deleteTrackFromDevice(DeviceTrack track) async {
+    var deleted = false;
+    try {
+      // content:// or file:// — try path first
+      final raw = track.uri;
+      String? path;
+      if (raw.startsWith('file://')) {
+        path = Uri.parse(raw).toFilePath();
+      } else if (raw.startsWith('/')) {
+        path = raw;
+      }
+      if (path != null) {
+        final file = File(path);
+        if (await file.exists()) {
+          await file.delete();
+          deleted = true;
+        }
+      }
+    } catch (_) {
+      deleted = false;
+    }
+
+    // Always remove from in-memory library so UI updates
+    tracks = tracks.where((t) => t.id != track.id).toList();
+    queue = queue.where((t) => t.id != track.id).toList();
+    favoriteIds.remove(track.id);
+    historyIds.remove(track.id);
+    for (final p in playlists) {
+      p.trackIds.remove(track.id);
+    }
+    if (currentTrack?.id == track.id) {
+      await _audioPlayer.stop();
+      currentTrack = null;
+      isPlaying = false;
+      playerOpen = false;
+      progress = Duration.zero;
+    }
+    await _savePlaylists();
+    notifyListeners();
+    return deleted;
+  }
+
   Future<void> toggleFavorite(int trackId) async {
     if (favoriteIds.contains(trackId)) {
       favoriteIds.remove(trackId);
@@ -526,9 +569,30 @@ class _PlayerRootState extends State<PlayerRoot> {
               controller.closePlaylistView();
             }
           },
-          child: showPlayer
-              ? PlayerScreen(controller: controller)
-              : LibraryScreen(controller: controller),
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 320),
+            switchInCurve: Curves.easeOutCubic,
+            switchOutCurve: Curves.easeInCubic,
+            transitionBuilder: (child, animation) {
+              final offset = Tween<Offset>(
+                begin: const Offset(0, 0.04),
+                end: Offset.zero,
+              ).animate(animation);
+              return FadeTransition(
+                opacity: animation,
+                child: SlideTransition(position: offset, child: child),
+              );
+            },
+            child: showPlayer
+                ? KeyedSubtree(
+                    key: const ValueKey('player'),
+                    child: PlayerScreen(controller: controller),
+                  )
+                : KeyedSubtree(
+                    key: const ValueKey('library'),
+                    child: LibraryScreen(controller: controller),
+                  ),
+          ),
         );
       },
     );
@@ -648,6 +712,94 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
   }
 
+  Future<void> _showTrackMenu(DeviceTrack track) async {
+    final controller = widget.controller;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    track.title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: text,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 15,
+                    ),
+                  ),
+                ),
+              ),
+              ListTile(
+                leading: Icon(
+                  controller.isFavorite(track.id)
+                      ? Icons.favorite
+                      : Icons.favorite_border,
+                  color: bloodBright,
+                ),
+                title: Text(
+                  controller.isFavorite(track.id)
+                      ? 'Убрать из избранного'
+                      : 'В избранное',
+                  style: const TextStyle(color: text),
+                ),
+                onTap: () {
+                  controller.toggleFavorite(track.id);
+                  Navigator.pop(ctx);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.playlist_add, color: textDim),
+                title: const Text(
+                  'Добавить в плейлист',
+                  style: TextStyle(color: text),
+                ),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showAddToPlaylist(track);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.info_outline, color: textDim),
+                title: const Text(
+                  'Информация',
+                  style: TextStyle(color: text),
+                ),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showTrackInfo(track);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: bloodBright),
+                title: const Text(
+                  'Удалить с устройства',
+                  style: TextStyle(color: bloodBright),
+                ),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _confirmDeleteTrack(track);
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   Future<void> _showAddToPlaylist(DeviceTrack track) async {
     final controller = widget.controller;
     await showModalBottomSheet<void>(
@@ -738,15 +890,252 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
+  Future<void> _showTrackInfo(DeviceTrack track) async {
+    String formatSize(int bytes) {
+      if (bytes <= 0) return '—';
+      if (bytes < 1024) return '$bytes B';
+      if (bytes < 1024 * 1024) {
+        return '${(bytes / 1024).toStringAsFixed(1)} KB';
+      }
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+
+    final path = track.uri;
+    final fileName = path.split('/').last.split('?').first;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: panel,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        Widget chip(String title, String value) {
+          return Expanded(
+            child: Container(
+              margin: const EdgeInsets.all(4),
+              padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+              decoration: BoxDecoration(
+                color: panelSoft,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: line),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    value,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: text,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    title,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: muted, fontSize: 10),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
+        Widget row(String label, String value) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: const TextStyle(color: muted, fontSize: 11)),
+                const SizedBox(height: 4),
+                Text(
+                  value.isEmpty ? '—' : value,
+                  style: const TextStyle(color: text, fontSize: 14),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(
+                      color: line,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                Row(
+                  children: [
+                    chip('Формат', fileName.toLowerCase().endsWith('.flac')
+                        ? 'FLAC'
+                        : fileName.toLowerCase().endsWith('.wav')
+                            ? 'WAV'
+                            : fileName.toLowerCase().endsWith('.m4a')
+                                ? 'M4A'
+                                : 'MPEG'),
+                    chip('Длительность', formatDuration(track.duration)),
+                    chip('Размер', formatSize(track.size)),
+                    chip('Каналы', '2 ch'),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'ФАЙЛ',
+                  style: TextStyle(
+                    color: muted,
+                    fontSize: 11,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: panelSoft,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: line),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      row('Название файла', fileName),
+                      const Divider(color: line, height: 1),
+                      row('Расположение', path),
+                      const Divider(color: line, height: 1),
+                      Row(
+                        children: [
+                          Expanded(child: row('Размер', formatSize(track.size))),
+                          Expanded(
+                            child: row(
+                              'Длительность',
+                              formatDuration(track.duration),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'ТЕГИ',
+                  style: TextStyle(
+                    color: muted,
+                    fontSize: 11,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: panelSoft,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: line),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      row('Название', track.title),
+                      const Divider(color: line, height: 1),
+                      row('Исполнитель', track.artist),
+                      const Divider(color: line, height: 1),
+                      row('Альбом', track.album ?? '—'),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _confirmDeleteTrack(DeviceTrack track) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: panel,
+        title: const Text('Удалить трек?', style: TextStyle(color: text)),
+        content: Text(
+          'Файл «${track.title}» будет удалён с устройства. Это действие нельзя отменить.',
+          style: const TextStyle(color: textDim),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Отмена', style: TextStyle(color: muted)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(
+              'Удалить',
+              style: TextStyle(color: bloodBright),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && mounted) {
+      final result = await widget.controller.deleteTrackFromDevice(track);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result
+                ? 'Трек удалён с устройства'
+                : 'Не удалось удалить файл. Нужно разрешение на доступ.',
+          ),
+          backgroundColor: panelSoft,
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final controller = widget.controller;
 
     if (controller.openPlaylist != null) {
-      return _PlaylistDetailScreen(
-        controller: controller,
-        playlist: controller.openPlaylist!,
-        onAddToPlaylist: _showAddToPlaylist,
+      return AnimatedSwitcher(
+        duration: const Duration(milliseconds: 280),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: (child, animation) {
+          final offset = Tween<Offset>(
+            begin: const Offset(0.06, 0),
+            end: Offset.zero,
+          ).animate(animation);
+          return FadeTransition(
+            opacity: animation,
+            child: SlideTransition(position: offset, child: child),
+          );
+        },
+        child: KeyedSubtree(
+          key: ValueKey('pl_${controller.openPlaylist!.id}'),
+          child: _PlaylistDetailScreen(
+            controller: controller,
+            playlist: controller.openPlaylist!,
+            onAddToPlaylist: _showTrackMenu,
+          ),
+        ),
       );
     }
 
@@ -761,12 +1150,31 @@ class _LibraryScreenState extends State<LibraryScreen> {
           children: [
             _LibraryHeader(onScan: controller.scanDevice),
             Expanded(
-              child: tab == 0
-                  ? _PlaylistsTab(
-                      controller: controller,
-                      onCreate: _showCreatePlaylistDialog,
-                    )
-                  : RefreshIndicator(
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 260),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) {
+                  final offset = Tween<Offset>(
+                    begin: const Offset(0.03, 0),
+                    end: Offset.zero,
+                  ).animate(animation);
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(position: offset, child: child),
+                  );
+                },
+                child: tab == 0
+                    ? KeyedSubtree(
+                        key: const ValueKey('tab_playlists'),
+                        child: _PlaylistsTab(
+                          controller: controller,
+                          onCreate: _showCreatePlaylistDialog,
+                        ),
+                      )
+                    : KeyedSubtree(
+                        key: const ValueKey('tab_tracks'),
+                        child: RefreshIndicator(
                       color: bloodBright,
                       backgroundColor: panel,
                       onRefresh: controller.scanDevice,
@@ -888,7 +1296,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                       track,
                                       fromQueue: visibleTracks,
                                     ),
-                                    onMore: () => _showAddToPlaylist(track),
+                                    onMore: () => _showTrackMenu(track),
                                   );
                                 },
                               ),
@@ -896,6 +1304,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         ],
                       ),
                     ),
+                      ),
+              ),
             ),
           ],
         ),
@@ -1890,16 +2300,6 @@ class PlayerScreen extends StatelessWidget {
                         letterSpacing: 1,
                       ),
                     ),
-                    const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: IconButton(
-                        onPressed: controller.backToLibrary,
-                        icon: const Icon(Icons.close_rounded, size: 22),
-                        color: muted,
-                        tooltip: 'Закрыть',
-                      ),
-                    ),
                   ],
                 ),
               ),
@@ -1976,35 +2376,49 @@ class VinylStage extends StatefulWidget {
 class _VinylStageState extends State<VinylStage>
     with TickerProviderStateMixin {
   late final AnimationController _spinController;
-  late final AnimationController _beatController;
+  late final AnimationController _kickController;
+  final Random _rng = Random();
+  Timer? _kickTimer;
   bool _wasPlaying = false;
 
   @override
   void initState() {
     super.initState();
+    // Full rotation every ~6.5s — visible continuous spin
     _spinController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 8),
+      duration: const Duration(milliseconds: 6500),
     );
-    _beatController = AnimationController(
+    // Sharp kick pulse (scale up then settle)
+    _kickController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 180),
+      duration: const Duration(milliseconds: 120),
     );
 
     if (widget.isPlaying) {
       _spinController.repeat();
-      _startBeat();
+      _scheduleNextKick();
     }
     _wasPlaying = widget.isPlaying;
   }
 
-  void _startBeat() {
-    _beatController.repeat(reverse: true);
+  void _scheduleNextKick() {
+    _kickTimer?.cancel();
+    // Kick every ~420–680ms (roughly 90–140 BPM feel)
+    final delay = 420 + _rng.nextInt(260);
+    _kickTimer = Timer(Duration(milliseconds: delay), () {
+      if (!mounted || !widget.isPlaying) return;
+      _kickController.forward(from: 0).then((_) {
+        if (mounted) _kickController.reverse();
+      });
+      _scheduleNextKick();
+    });
   }
 
-  void _stopBeat() {
-    _beatController.stop();
-    _beatController.animateTo(0, duration: const Duration(milliseconds: 300));
+  void _stopKick() {
+    _kickTimer?.cancel();
+    _kickTimer = null;
+    _kickController.animateTo(0, duration: const Duration(milliseconds: 200));
   }
 
   @override
@@ -2014,20 +2428,20 @@ class _VinylStageState extends State<VinylStage>
     _wasPlaying = widget.isPlaying;
 
     if (widget.isPlaying) {
-      // Smooth start spinning
       _spinController.repeat();
-      _startBeat();
+      _scheduleNextKick();
     } else {
-      // Smooth stop
+      // Smooth decelerate: stop repeat but keep current angle
       _spinController.stop();
-      _stopBeat();
+      _stopKick();
     }
   }
 
   @override
   void dispose() {
+    _kickTimer?.cancel();
     _spinController.dispose();
-    _beatController.dispose();
+    _kickController.dispose();
     super.dispose();
   }
 
@@ -2045,12 +2459,12 @@ class _VinylStageState extends State<VinylStage>
             border: Border.all(color: const Color(0x1ACBC9C8)),
           ),
           child: AnimatedBuilder(
-            animation: Listenable.merge([_spinController, _beatController]),
+            animation: Listenable.merge([_spinController, _kickController]),
             builder: (_, child) {
-              // Slight beat "jerk" — scale + tiny wobble
-              final beat = _beatController.value;
-              final scale = 1.0 + (beat * 0.018);
-              final wobble = (beat - 0.5) * 0.012;
+              // Sharp kick: brief scale punch + micro wobble
+              final k = Curves.easeOut.transform(_kickController.value);
+              final scale = 1.0 + (k * 0.045);
+              final wobble = sin(k * pi) * 0.035;
 
               return Transform.scale(
                 scale: scale,
