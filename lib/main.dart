@@ -2533,30 +2533,36 @@ class _VinylStageState extends State<VinylStage>
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = min(constraints.maxWidth, constraints.maxHeight);
-        // Continuous low bob from energy + sharp kick on beat onsets
-        final scale = 1.0 + (_energy * 0.04) + (_kick * 0.07);
-        final wobble = _kick * 0.05;
+        // Padding ~12% → max scale ≈ 1.24 before hitting the frame.
+        // Loud beats grow more; hard clamp keeps disc inside the border.
+        final rawScale = 1.0 + (_energy * 0.12) + (_kick * 0.18);
+        final scale = rawScale.clamp(1.0, 1.22);
+        final wobble = _kick * 0.04;
 
         return Container(
           width: size,
           height: size,
-          padding: EdgeInsets.all(size * .08),
+          padding: EdgeInsets.all(size * .12),
           decoration: BoxDecoration(
             color: const Color(0xFF0B090A),
             border: Border.all(color: const Color(0x1ACBC9C8)),
           ),
-          child: AnimatedBuilder(
-            animation: _spinController,
-            builder: (_, child) {
-              return Transform.scale(
-                scale: scale,
-                child: Transform.rotate(
-                  angle: _spinController.value * pi * 2 + wobble,
-                  child: child,
-                ),
-              );
-            },
-            child: const VinylDisc(),
+          // Clip so the disc never draws past the frame
+          child: ClipRect(
+            child: AnimatedBuilder(
+              animation: _spinController,
+              builder: (_, child) {
+                return Transform.scale(
+                  scale: scale,
+                  alignment: Alignment.center,
+                  child: Transform.rotate(
+                    angle: _spinController.value * pi * 2 + wobble,
+                    child: child,
+                  ),
+                );
+              },
+              child: const VinylDisc(),
+            ),
           ),
         );
       },
