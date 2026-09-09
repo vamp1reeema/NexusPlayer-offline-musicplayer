@@ -179,8 +179,8 @@ class _EqualizerScreenState extends State<EqualizerScreen> {
                   const SizedBox(width: 10),
                   Switch(
                     value: enabled,
+                    activeColor: _silver,
                     activeTrackColor: _bloodBright,
-                    activeThumbColor: _silver,
                     onChanged: (v) async {
                       setState(() => enabled = v);
                       await EqualizerEngine.setEnabled(v);
