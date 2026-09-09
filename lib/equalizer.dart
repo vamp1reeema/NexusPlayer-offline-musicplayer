@@ -456,3 +456,18 @@ class _EffectCard extends StatelessWidget {
     );
   }
 }
+
+
+/// Real-time audio energy from Android Visualizer (0.0 … 1.0).
+class AudioVisualizer {
+  static const _channel = EventChannel('nexus_player/visualizer');
+  static Stream<double>? _stream;
+
+  static Stream<double> get stream {
+    _stream ??= _channel.receiveBroadcastStream().map((e) {
+      if (e is num) return e.toDouble().clamp(0.0, 1.0);
+      return 0.0;
+    });
+    return _stream!;
+  }
+}

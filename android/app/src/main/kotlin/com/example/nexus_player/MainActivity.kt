@@ -4,22 +4,33 @@ import android.media.audiofx.BassBoost
 import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
 import android.media.audiofx.Virtualizer
+import android.media.audiofx.Visualizer
 import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.sqrt
 
 class MainActivity : AudioServiceActivity() {
     private val channelName = "nexus_player/equalizer"
+    private val vizChannelName = "nexus_player/visualizer"
 
     private var equalizer: Equalizer? = null
     private var bassBoost: BassBoost? = null
     private var virtualizer: Virtualizer? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var visualizer: Visualizer? = null
     private var sessionId: Int = 0
     private var eqEnabled: Boolean = true
 
+    private var vizEvents: EventChannel.EventSink? = null
+    private var lastEnergy: Double = 0.0
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
                 try {
@@ -38,7 +49,6 @@ class MainActivity : AudioServiceActivity() {
                         "setBand" -> {
                             val index = call.argument<Int>("index") ?: 0
                             val level = call.argument<Double>("level") ?: 0.0
-                            // level in dB, Android uses millibels
                             equalizer?.setBandLevel(index.toShort(), (level * 100).toInt().toShort())
                             result.success(null)
                         }
@@ -48,7 +58,7 @@ class MainActivity : AudioServiceActivity() {
                             result.success(bandInfo())
                         }
                         "setBassBoost" -> {
-                            val strength = call.argument<Int>("strength") ?: 0 // 0..1000
+                            val strength = call.argument<Int>("strength") ?: 0
                             if (bassBoost == null && sessionId != 0) {
                                 bassBoost = BassBoost(0, sessionId)
                             }
@@ -84,11 +94,27 @@ class MainActivity : AudioServiceActivity() {
                     result.error("EQ_ERROR", e.message, null)
                 }
             }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, vizChannelName)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    vizEvents = events
+                    // restart visualizer if session already known
+                    if (sessionId != 0) startVisualizer(sessionId)
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    vizEvents = null
+                }
+            })
     }
 
     private fun attach(id: Int) {
         if (id == 0) return
-        if (id == sessionId && equalizer != null) return
+        if (id == sessionId && equalizer != null) {
+            startVisualizer(id)
+            return
+        }
         releaseFx()
         sessionId = id
         try {
@@ -97,7 +123,63 @@ class MainActivity : AudioServiceActivity() {
             virtualizer = Virtualizer(0, sessionId)
             loudnessEnhancer = LoudnessEnhancer(sessionId)
         } catch (_: Exception) {
-            // Device may not support all effects
+        }
+        startVisualizer(sessionId)
+    }
+
+    private fun startVisualizer(id: Int) {
+        try {
+            visualizer?.enabled = false
+            visualizer?.release()
+        } catch (_: Exception) {
+        }
+        visualizer = null
+        if (id == 0) return
+        try {
+            val viz = Visualizer(id)
+            val range = Visualizer.getCaptureSizeRange()
+            viz.captureSize = range[1] // max
+            viz.setDataCaptureListener(
+                object : Visualizer.OnDataCaptureListener {
+                    override fun onWaveFormDataCapture(
+                        visualizer: Visualizer?,
+                        waveform: ByteArray?,
+                        samplingRate: Int
+                    ) {
+                        if (waveform == null || vizEvents == null) return
+                        // RMS energy 0..1
+                        var sum = 0.0
+                        for (b in waveform) {
+                            val v = (b.toInt() and 0xFF) - 128
+                            sum += (v * v).toDouble()
+                        }
+                        val rms = sqrt(sum / waveform.size) / 128.0
+                        // light smoothing so kicks aren't noisy
+                        lastEnergy = lastEnergy * 0.35 + rms * 0.65
+                        // peak emphasis for beat feel
+                        val peak = max(lastEnergy, rms)
+                        try {
+                            vizEvents?.success(peak.coerceIn(0.0, 1.0))
+                        } catch (_: Exception) {
+                        }
+                    }
+
+                    override fun onFftDataCapture(
+                        visualizer: Visualizer?,
+                        fft: ByteArray?,
+                        samplingRate: Int
+                    ) {
+                        // unused — waveform is enough for vinyl kick
+                    }
+                },
+                Visualizer.getMaxCaptureRate() / 2, // ~10–15 Hz updates
+                true,  // waveform
+                false  // fft
+            )
+            viz.enabled = true
+            visualizer = viz
+        } catch (_: Exception) {
+            visualizer = null
         }
     }
 
@@ -106,25 +188,31 @@ class MainActivity : AudioServiceActivity() {
         try { bassBoost?.release() } catch (_: Exception) {}
         try { virtualizer?.release() } catch (_: Exception) {}
         try { loudnessEnhancer?.release() } catch (_: Exception) {}
+        try {
+            visualizer?.enabled = false
+            visualizer?.release()
+        } catch (_: Exception) {}
         equalizer = null
         bassBoost = null
         virtualizer = null
         loudnessEnhancer = null
+        visualizer = null
         sessionId = 0
+        lastEnergy = 0.0
     }
 
     private fun bandInfo(): Map<String, Any?> {
         val eq = equalizer ?: return mapOf(
             "supported" to false,
             "bands" to emptyList<Map<String, Any>>(),
-            "minLevel" to -1500,
-            "maxLevel" to 1500
+            "minLevel" to -15.0,
+            "maxLevel" to 15.0
         )
         val n = eq.numberOfBands.toInt()
         val bands = mutableListOf<Map<String, Any>>()
         for (i in 0 until n) {
-            val center = eq.getCenterFreq(i.toShort()) / 1000 // Hz
-            val level = eq.getBandLevel(i.toShort()).toInt() / 100.0 // dB
+            val center = eq.getCenterFreq(i.toShort()) / 1000
+            val level = eq.getBandLevel(i.toShort()).toInt() / 100.0
             bands.add(mapOf("index" to i, "freq" to center, "level" to level))
         }
         val range = eq.bandLevelRange
@@ -136,7 +224,6 @@ class MainActivity : AudioServiceActivity() {
         )
     }
 
-    /** Approximate common presets in dB for available bands */
     private fun applyPreset(name: String) {
         val eq = equalizer ?: return
         val n = eq.numberOfBands.toInt()

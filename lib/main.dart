@@ -11,6 +11,8 @@ import 'package:just_audio_background/just_audio_background.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:permission_handler/permission_handler.dart';
+
 import 'equalizer.dart';
 
 const bg = Color(0xFF100D0D);
@@ -2441,52 +2443,67 @@ class VinylStage extends StatefulWidget {
   State<VinylStage> createState() => _VinylStageState();
 }
 
+/// Vinyl spins continuously while playing and *reacts to real audio energy*
+/// from the Android Visualizer (not a random timer).
 class _VinylStageState extends State<VinylStage>
     with TickerProviderStateMixin {
   late final AnimationController _spinController;
-  late final AnimationController _kickController;
-  final Random _rng = Random();
-  Timer? _kickTimer;
+  StreamSubscription<double>? _vizSub;
   bool _wasPlaying = false;
+
+  /// Smoothed energy 0..1 from Visualizer
+  double _energy = 0.0;
+  /// Previous energy for beat-onset detection
+  double _prevEnergy = 0.0;
+  /// Short kick envelope 0..1 (decays each frame)
+  double _kick = 0.0;
 
   @override
   void initState() {
     super.initState();
-    // Full rotation every ~6.5s — visible continuous spin
     _spinController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 4000),
     );
-    // Sharp kick pulse (scale up then settle)
-    _kickController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 120),
-    );
-
     if (widget.isPlaying) {
       _spinController.repeat();
-      _scheduleNextKick();
+      _startViz();
     }
     _wasPlaying = widget.isPlaying;
   }
 
-  void _scheduleNextKick() {
-    _kickTimer?.cancel();
-    // Kick every ~420–680ms (roughly 90–140 BPM feel)
-    final delay = 420 + _rng.nextInt(260);
-    _kickTimer = Timer(Duration(milliseconds: delay), () {
+  Future<void> _startViz() async {
+    // Visualizer needs mic permission on many OEMs
+    try {
+      final status = await Permission.microphone.request();
+      if (!status.isGranted) {
+        // Still try — some devices allow session-only capture
+      }
+    } catch (_) {}
+    await _vizSub?.cancel();
+    _vizSub = AudioVisualizer.stream.listen((e) {
       if (!mounted || !widget.isPlaying) return;
-      _kickController.forward(from: 0).then((_) {
-        if (mounted) _kickController.reverse();
-      });
-      _scheduleNextKick();
+      // Beat onset: energy jumps above a threshold relative to recent level
+      final rise = e - _prevEnergy;
+      if (e > 0.18 && rise > 0.045) {
+        // Stronger beats → stronger kick
+        final strength = ((e - 0.1) / 0.7).clamp(0.25, 1.0);
+        if (strength > _kick) _kick = strength;
+      }
+      _prevEnergy = e;
+      _energy = e;
+      // Decay kick quickly so each hit is punchy
+      _kick = (_kick * 0.82).clamp(0.0, 1.0);
+      setState(() {});
     });
   }
 
-  void _stopKick() {
-    _kickTimer?.cancel();
-    _kickTimer = null;
-    _kickController.animateTo(0, duration: const Duration(milliseconds: 200));
+  void _stopViz() {
+    _vizSub?.cancel();
+    _vizSub = null;
+    _energy = 0;
+    _prevEnergy = 0;
+    _kick = 0;
   }
 
   @override
@@ -2494,22 +2511,20 @@ class _VinylStageState extends State<VinylStage>
     super.didUpdateWidget(oldWidget);
     if (widget.isPlaying == _wasPlaying) return;
     _wasPlaying = widget.isPlaying;
-
     if (widget.isPlaying) {
       _spinController.repeat();
-      _scheduleNextKick();
+      _startViz();
     } else {
-      // Smooth decelerate: stop repeat but keep current angle
       _spinController.stop();
-      _stopKick();
+      _stopViz();
+      setState(() {});
     }
   }
 
   @override
   void dispose() {
-    _kickTimer?.cancel();
+    _stopViz();
     _spinController.dispose();
-    _kickController.dispose();
     super.dispose();
   }
 
@@ -2518,6 +2533,10 @@ class _VinylStageState extends State<VinylStage>
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = min(constraints.maxWidth, constraints.maxHeight);
+        // Continuous low bob from energy + sharp kick on beat onsets
+        final scale = 1.0 + (_energy * 0.04) + (_kick * 0.07);
+        final wobble = _kick * 0.05;
+
         return Container(
           width: size,
           height: size,
@@ -2527,13 +2546,8 @@ class _VinylStageState extends State<VinylStage>
             border: Border.all(color: const Color(0x1ACBC9C8)),
           ),
           child: AnimatedBuilder(
-            animation: Listenable.merge([_spinController, _kickController]),
+            animation: _spinController,
             builder: (_, child) {
-              // Sharp kick: brief scale punch + micro wobble
-              final k = Curves.easeOut.transform(_kickController.value);
-              final scale = 1.0 + (k * 0.045);
-              final wobble = sin(k * pi) * 0.035;
-
               return Transform.scale(
                 scale: scale,
                 child: Transform.rotate(
